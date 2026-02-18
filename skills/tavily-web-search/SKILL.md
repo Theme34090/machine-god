@@ -67,6 +67,32 @@ cd skills/tavily-web-search/scripts && uv run --with requests search.py <query1>
 | `--auto-parameters` | Auto-configure based on query intent |
 | `--include-usage` | Include credit usage info |
 
+## Search Depth
+
+Controls the latency vs. relevance tradeoff:
+
+| Depth | Latency | Relevance | Content Type |
+|-------|---------|-----------|--------------|
+| `ultra-fast` | Lowest | Lower | NLP summary |
+| `fast` | Low | Good | Chunks |
+| `basic` | Medium | High | NLP summary |
+| `advanced` | Higher | Highest | Chunks |
+
+**When to use each:**
+- `ultra-fast`: Real-time chat, autocomplete, latency-critical
+- `fast`: Need chunks but latency matters
+- `basic`: General-purpose, balanced
+- `advanced`: Precision matters (default, suitable for most use cases)
+
+## Tips
+
+- **Keep queries under 400 characters** — think search query, not prompt
+- **Break complex queries into sub-queries** — better results than one massive query
+- **Use `--include-domains`** to focus on trusted sources
+- **Use `--time-range`** for recent information
+- **Filter by `score`** (0-1) to get highest relevance results
+- **Use `--topic news`** when you need publication dates
+
 ## Output
 
 JSON array to stdout:
