@@ -12,7 +12,7 @@ Fetches and extracts content from X (Twitter) URLs including single posts, threa
 Run the script:
 
 ```bash
-cd skills/fetch-twitter/scripts && uv run fetch.py <x-url>
+cd skills/fetch-twitter/scripts && uv run --with requests fetch.py <x-url>
 ```
 
 ## Input
