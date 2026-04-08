@@ -1,0 +1,30 @@
+{
+    "attribution": {
+      "commit": "",
+      "pr": ""
+    },
+    "permissions": {
+      "defaultMode": "default"
+    },
+    "hooks": {
+      "PreToolUse": [
+        {
+          "matcher": "Bash",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "python3 ~/.claude/hooks/block-installs.py"
+            }
+          ]
+        }
+      ]
+    },
+    "statusLine": {
+      "type": "command",
+      "command": "~/.claude/statusline.sh"
+    },
+    "effortLevel": "high",
+    "skipDangerousModePermissionPrompt": true,
+    "showThinkingSummaries": true
+  }
+  
