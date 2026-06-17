@@ -11,20 +11,32 @@
 // Env:
 //   FIGMA_CHANNEL  — channel name (required)
 //   FIGMA_NODES    — JSON: [{ "id": "123:456", "filename": "out.png" }, ...]
-//   OUT_DIR        — output directory (default: /tmp)
+//   OUT_DIR        — output directory (REQUIRED, must be absolute path)
+//   SCALE          — @Nx export scale (default: 2)
 //
 // Bridge protocol reference: ~/work/cursor-talk-to-figma-mcp/dist/server.js
 
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 
 const CHANNEL = process.env.FIGMA_CHANNEL;
 const NODES = JSON.parse(process.env.FIGMA_NODES);
-const OUT_DIR = process.env.OUT_DIR || '/tmp';
+const OUT_DIR = process.env.OUT_DIR;
+if (!OUT_DIR || !path.isAbsolute(OUT_DIR)) {
+  console.error('FATAL: OUT_DIR must be set to an absolute path. A relative path resolves against cwd and silently creates nested junk dirs if a prior `cd` ran in this shell. Got: ' + JSON.stringify(OUT_DIR));
+  process.exit(2);
+}
+console.log('OUT_DIR resolved to:', OUT_DIR);
 mkdirSync(OUT_DIR, { recursive: true });
+
+const SCALE = Number(process.env.SCALE) || 2;
+// Plugin (cursor_mcp_plugin/code.js) hardcodes format='PNG' and discards SVG/JPG/PDF.
+// Caller's format param never reaches Figma — do not pretend otherwise.
 
 const ws = new WebSocket('ws://localhost:3055');
 const pending = new Map();
+const failed = [];
 
 const send = (command, params) => new Promise((resolve, reject) => {
   const id = randomUUID();
@@ -46,13 +58,29 @@ ws.addEventListener('message', (ev) => {
 
 ws.addEventListener('open', async () => {
   await send('join', { channel: CHANNEL });
-  for (const { id, filename } of NODES) {
-    const res = await send('export_node_as_image', { nodeId: id, format: 'PNG', scale: 2 });
+  for (const { id: nodeId, filename } of NODES) {
+    const res = await send('export_node_as_image', { nodeId, format: 'PNG', scale: SCALE });
     const buf = Buffer.from(res.imageData, 'base64');
-    writeFileSync(`${OUT_DIR}/${filename}`, buf);
-    console.log(`wrote ${OUT_DIR}/${filename} (${buf.length} bytes)`);
+    const filePath = `${OUT_DIR}/${filename}`;
+    writeFileSync(filePath, buf);
+    // PNG IHDR at byte offset 16: 4 bytes width + 4 bytes height, big-endian.
+    const width  = buf.length >= 24 ? buf.readUInt32BE(16) : 0;
+    const height = buf.length >= 24 ? buf.readUInt32BE(20) : 0;
+    if (buf.length < 1024 || width < 8 || height < 8) {
+      failed.push({ nodeId, filename, bytes: buf.length, width, height });
+      console.error(`ASSET_INVALID ${nodeId} ${filename} ${buf.length}B ${width}x${height}`);
+      continue;
+    }
+    console.log(`wrote ${filePath} (${buf.length} bytes, ${width}x${height})`);
   }
-  ws.close(); process.exit(0);
+  ws.close();
+  if (failed.length) {
+    console.error('Bulk export had ' + failed.length + ' invalid asset(s):');
+    for (const f of failed) console.error('  ' + JSON.stringify(f));
+    console.error('Do NOT silently substitute or drop these. Surface to the user and request drag-export.');
+    process.exit(2);
+  }
+  process.exit(0);
 });
 
 ws.addEventListener('error', (e) => { console.error('ws error', e?.message ?? e); process.exit(1); });

@@ -10,7 +10,15 @@ description: Implement a UI screen or component from a Figma design with high vi
 2. Phase 2 — main agent re-renders the node, reads the spec, reconciles with codebase tokens/components, writes code.
 3. Verify visually in a real browser before declaring done.
 
-We split Phase 1 out because Figma MCP exploration generates a lot of JSON noise and the screenshot-based visual read is lossy on its own. Running the noisy part in a subagent and passing back a distilled summary keeps the main agent's context clean for the part that actually matters — codebase reconciliation and writing code.
+## STOP — before any node-reading MCP call
+
+Before you call any of `get_document_info`, `get_node_info`, `get_nodes_info`, `scan_nodes_by_types`, `scan_text_nodes`, `get_styles`, `get_local_components`, or `export_node_as_image` — STOP.
+
+- If you have NOT spawned a Phase 1 subagent and received its digest yet: spawn it now. Do not inline these calls in your own context.
+- `join_channel` is the documented exception — it has no payload to spill.
+- If you have already made any node-reading MCP call in this turn: tell the user 'I skipped Phase 1 — restarting via subagent' and spawn the subagent fresh. It will re-walk the node (idempotent reads, cheap re-exports) and produce the auditable spec file. Your context is already polluted; the spec file is the user-auditable artifact.
+
+**Why this is a hard gate, not a suggestion:** an inline `get_node_info` on a multi-component frame routinely exceeds 30k tokens of nested JSON and has spilled to 2MB+ in observed sessions. Phase 2 reconciliation and code-writing budget is what gets squeezed. Without the `/tmp/figma-<node-id>.md` spec file, there is also no artifact for the user to audit the implementation against later — only your chat narration.
 
 Throughout this skill, "figma mcp" means the **TalkToFigma** MCP (tools named `mcp__TalkToFigma__*`).
 
@@ -42,7 +50,7 @@ If the user provides multiple Figma URLs/nodes in a single prompt, treat the mul
 
 ## Phase 1 — Subagent extracts the design spec
 
-Spawn a **Sonnet** subagent (read-heavy, not reasoning-heavy) with figma mcp access. The prompt should instruct it to do all of the following.
+Spawn a **Opus** subagent (read-heavy, not reasoning-heavy) with figma mcp access. The prompt should instruct it to do all of the following.
 
 ### What the subagent does
 
@@ -81,40 +89,67 @@ The MCP cannot save the design screenshot to disk. The subagent uses its own inl
 
 ## Phase 2 — Main agent implements
 
-### Step 1: Render and narrate the screenshot
+### Step 1: Render, narrate, and emit the scope/surface block
 
 Call `export_node_as_image` yourself on the target node — the inline PNG appears in your tool result. Read the spec file (`/tmp/figma-<node-id>.md`).
 
-Write a short top-to-bottom description in your own words.
+Before moving to Step 2, your narration MUST end with these explicit lines (each line present, even if empty):
 
-**Call out surfaces and z-layers first.** Is this a flat page, or does a card float on a distinct background? Are there visual groupings created purely by surface color or shadow depth? Getting surfaces right on the first pass is the single biggest factor in matching the design, and it's the easiest thing to miss when you jump straight to component structure. If you're unsure, ask the user: "is this one flat page, or does the card float on a different bg?"
+```
+ROOT SURFACE: <page bg color / image>
+PARENT MOUNT: <standalone page | inside <ParentComponent> | bottom-sheet over <X> | dialog over <Y>>
+CARD LAYER: <full-bleed | inset N% gutters | none>
+Z-ORDER (top → bottom): <list>
+WILL IMPLEMENT: <Figma elements I will build>
+WILL OMIT (in Figma, not in code): <element + reason, or 'none'>
+WILL ADD (in code, not in Figma): <element + reason, or 'none'>
+KNOWN UNKNOWNS: <questions for user, or 'none'>
+```
 
-Then enumerate components top to bottom, matching the spec.
+If `PARENT MOUNT` is anything other than 'standalone page', `WILL OMIT` is non-empty, `WILL ADD` is non-empty, or `KNOWN UNKNOWNS` is non-empty — STOP and use AskUserQuestion before any Write/Edit to a `.tsx` file.
+
+**Why this is a literal output gate:** the most expensive failures observed (sections built outside the real sheet container, hallucinated back-buttons, silently-dropped mascot heroes, scope creep on copy) all stem from skipping this narration. `PARENT MOUNT` and `Z-ORDER` cannot be derived from `get_node_info` — it omits ancestor context. Compose them from the inline PNG + spec file + your codebase recon, and ask the user when the Figma node alone can't answer.
 
 ### Step 2: Reconcile with the existing codebase
 
-Before writing any new CSS, variables, or component variants:
+STOP. Before any Write/Edit with a hex literal or arbitrary Tailwind class:
 
-- **Grep the project's token file** (`globals.css` or equivalent) for existing CSS variables. Most of the palette is likely already defined — `--gray-25`, `--blue-main`, `--blue-lighter`, etc. The Figma palette usually maps 1:1.
-- **Check existing component variants.** A matching `brand` badge, `brand-outline` button, etc. often already exists. Search for similar components (cards, step lists, CTA rows) and reuse their patterns.
-- **Multi-screen: scan all spec files for repeated new tokens/components.** If two specs both introduce the same new color or badge style, unify before duplicating. Skipping this is how you end up with two near-identical CSS additions or two parallel components that should have been one.
+- [ ] For each `#xxxxxx` in the spec you intend to use, run `grep -rn '<hex>' apps/frontend/app/globals.css apps/frontend/tailwind.config.*`. If a hit, use the token. Paste the grep result inline before the Write.
+- [ ] For each `rounded-[Npx]`, `bg-[#...]`, `border-[#...]`, `text-[#...]` you'd write, grep `apps/frontend/components/ui/` for the same pattern. If a hit, use the existing class.
+- [ ] Multi-screen: scan all spec files for the same new color/component before duplicating.
 
-Inventing inline hex colors or redefining tokens is a code-review smell. Match an existing variant first; introduce a new token only if nothing fits.
+No new token or arbitrary-value class without a one-line 'no existing match because X' justification in your narration. Inventing inline hex colors or redefining tokens is a code-review smell.
 
-### Step 3: Wire graphic assets — do not rebuild them in HTML
+**Post-Write check (before commit):** run `git diff -U0 | grep -E '\[#|rounded-\[|bg-\[|border-\[|text-\['` on staged changes. For each remaining hit, either map to a token or justify in one line.
 
-If the spec lists graphics, the asset files have to live on disk somewhere in the project (e.g., `apps/frontend/public/images/...`). The MCP wrapper drops the bytes after returning them inline, so it cannot put them there for you. Either:
+### Step 3: Wire graphic assets — STOP gate
 
-- Ask the user to drag-export the node from Figma and drop it into the assets directory, or
-- Reuse an existing asset already in the codebase if the spec description matches one, or
-- **On request only — bulk export via the WS bridge** (see `references/bulk-export.md` and `scripts/figma-export.mjs`). Do not reach for this unprompted; default to the drag-export ask.
+Graphic assets live on disk in the project (e.g., `apps/frontend/public/images/...`). The MCP wrapper drops the bytes after returning `export_node_as_image` inline, so the MCP cannot put them there.
 
-Do **not** attempt to reproduce illustrations, logos, charts, or multi-path icons in HTML/CSS — it always looks worse than the exported asset, burns time, and hides the fact that a real asset was available. The only exceptions are:
+Before writing any SVG or CSS for a visual element, STOP and check your own output:
 
-- A primitive shape (solid circle, stroked line, simple geometric accent) clearly built from CSS.
-- An icon that already exists in the project's icon library — reuse that instead of a Figma export.
+- inline `<svg>` with >2 `<path>`/`<polygon>` elements → STOP, export
+- `clip-path: polygon(...)` or `mask-image:` with custom geometry → STOP, export
+- `<canvas>` painted with hatch / sparkle / scratch / foil patterns → STOP, export
+- `repeating-linear-gradient` + `::before`/`::after` to fake a torn / zigzag / sawtooth edge → STOP, export
+- any element whose Figma source is a hand-drawn / Streamline / Freehand illustration set → STOP, export (regardless of how 'simple' it looks rendered)
+- any decorative scatter (sparkles, confetti, particles, doodles) → STOP, export
 
-If you find yourself reaching for nested divs with `border-radius` and gradients to approximate a shape you saw in the screenshot, stop. Either ask the user to export the asset, or check the icon library for a match.
+On STOP, do exactly one of:
+
+1. Reuse an existing asset already in the codebase if the spec description matches one.
+2. AskUserQuestion: 'Please drag-export node `<id>` to `<path>`.'
+3. Use the WS-bridge bulk export — but ONLY if the user's original prompt contained an explicit export verb ('export those', 'grab the PNGs', 'pull the assets'). See `references/bulk-export.md`.
+
+**Allowed exceptions** (do NOT trigger STOP):
+- A primitive shape (solid circle, stroked line, single rectangle, simple geometric accent).
+- An icon that already exists in the project's icon library.
+- An SVG `<circle>` + `<text dominant-baseline='central'>` for a circled-number badge.
+
+**Anti-patterns observed — do NOT do these:**
+- 'This is a primitive geometric pattern — buildable in CSS.' (Said about a multi-tooth torn-paper edge. It wasn't.)
+- Painting foil hatch / sparkle scatter with `<canvas>` primitives. (Always looks worse than the export.)
+- Substituting lucide icons for Streamline/Freehand illustrations and flagging as 'known nit'. (The user did not authorize the substitution.)
 
 #### On-request bulk export (WS-bridge escape hatch)
 
@@ -129,9 +164,33 @@ See `references/bulk-export.md` for the full recipe — prerequisites, env vars,
 - Sentence case for UI text unless the design clearly uses Title Case.
 - **Bundle multi-screen changes into one push.** Local-e2e rebuilds cost ~3-4 min per cycle; batch related visual fixes before triggering verification.
 
-### Step 5: Verify visually
+### Step 5: Verify visually — production mount only, two-strike escalation
 
-If a local dev or e2e environment is available, render the page in a real browser and compare side-by-side against the screenshot. Note any delta — surfaces, spacing, font weight, shadows — before declaring done. Type-check/tests verify correctness, not fidelity; only a visual pass catches surface-level misses.
+STOP. Before declaring done, render the screen **at the same route/mount the user will hit in production**.
+
+DO:
+- Navigate to the real route inside the real parent (`ReceiptCreateDialog`, claim flow, dashboard shell, etc.).
+- Use `/test-prep` + seed data to bypass auth / feature-flag / state gates.
+- Screenshot side-by-side against the Figma render.
+
+DO NOT:
+- Build a standalone HTML mock with the exported PNGs and screenshot that.
+- Add a `/preview-*` route to render the component in isolation and call that 'verified'.
+- Substitute 'code review is enough' or 'the screen is gated, can't reach it' for a real screenshot.
+
+If the gated state is genuinely unreachable (destructive credit-claim, one-shot onboarding), surface the specific seeding gap to the user and ASK whether to proceed without live verify. Do not silently substitute a mock.
+
+**Two-strike escalation on any single visual delta** (placement, alignment, crop, padding, surface color):
+
+- Attempt 1 fails → one more tweak, with a written hypothesis.
+- Attempt 2 fails → STOP. Do NOT try a 3rd value tweak on the same delta. Use AskUserQuestion with options classified by delta type:
+  - **Graphic-asset delta** (illustration crop, boundary line, decorative image): the wrapper drops `export_node_as_image` bytes, so CSS-cropping a fake will keep diverging. Options: (a) drag-export the full asset, (b) WS-bridge bulk export, (c) ship as-is with TODO.
+  - **Font-metric / centering delta** (circled-number badge, vertically-centered Thai glyph): HTML line-height never matches Figma's text-box metrics. Options: (a) rebuild as SVG `<circle>` + `<text dominant-baseline='central'>`, (b) accept ±1px, (c) change layout to remove the centering requirement.
+  - **Spacing/padding delta**: re-read the spec file rather than tweaking a 3rd value; if the spec is silent, ask the user.
+
+Tuning the same lever 3+ times means you're on the wrong primitive, not the wrong value.
+
+**Iteration hygiene:** when overwriting an exported asset filename during iteration, append `-v2`, `-v3` to bust Next.js image cache. Rename to the canonical filename only after the user approves — otherwise you may be debugging a stale render.
 
 For multi-screen jobs, do this once at the end across all screens — single browser session, sequential navigation, one screenshot per screen.
 
