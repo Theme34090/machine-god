@@ -1,6 +1,6 @@
 ---
 name: custom-review
-description: Multi-agent PR review — fans out 4 parallel subagents (bug+in-change-invariant scan on Opus, blast-radius+caller-invariants on Opus, CLAUDE.md/AGENTS.md conventions on Sonnet, git history on Sonnet), runs a single Sonnet triage that dedupes findings, assigns each both a bucket (Issue / Likely intentional / Pre-existing / Outside change) and a severity (🔴 high / 🟡 medium / 🔵 nit / ❓ question) anchored to mergeability or reviewer-uncertainty, and posts a hybrid GitHub PR review (inline comments for in-diff findings, body comment for out-of-diff findings). Use when the user says "custom review", "deep review", "multi-agent review", "/custom-review", or hands you a PR URL/number with "review this carefully". NOT for local pre-commit (use /review-simplify) and NOT for post-PR-open bot-driven loops (use /pr-review-and-fix).
+description: Multi-agent PR review — fans out 4 parallel subagents (bug+in-change-invariant scan on Opus, blast-radius+caller-invariants on Opus, CLAUDE.md/AGENTS.md conventions on Sonnet, git history on Sonnet), runs a single Sonnet triage that dedupes findings, assigns each both a bucket (Issue / Likely intentional / Pre-existing / Outside change) and a severity (🔴 high / 🟡 medium / 🔵 nit / ❓ question) anchored to mergeability or reviewer-uncertainty, and posts a hybrid GitHub PR review (inline comments for in-diff findings, body comment for out-of-diff findings). **Re-review mode:** when the skill detects a prior `<!-- custom-review:<SHA> -->` marker, it adds a 5th parallel Opus agent that walks prior threads, decides resolve / push-back per Q7 heuristics, and emits replies + `resolveReviewThread` mutations alongside a delta-scoped new review (see `references/re-review.md`). Use when the user says "custom review", "deep review", "multi-agent review", "/custom-review", "re-review", or hands you a PR URL/number with "review this carefully". NOT for local pre-commit (use /review-simplify) and NOT for post-PR-open bot-driven loops (use /pr-review-and-fix).
 ---
 
 # custom-review
@@ -17,13 +17,18 @@ Independent multi-agent review of an open GitHub PR. Posts a single GitHub revie
 ## Pipeline overview
 
 ```
-arg → eligibility → conventions gather → PR summary
-                                              ↓
-                              4 parallel review agents
-                                              ↓
-                                       Sonnet triage
-                                              ↓
-                              re-check eligibility → post review
+arg → eligibility → mode dispatch (preflight) → conventions gather → PR summary
+                                                                        ↓
+                                       round-1 mode: 4 parallel review agents
+                                       re-review mode: 5 parallel agents (adds close-loop)
+                                                                        ↓
+                                                                 Sonnet triage
+                                                                        ↓
+                                                          re-check eligibility
+                                                                        ↓
+                                       round-1 post: post review (references/posting.md)
+                                       re-review post: replies + resolves + new review
+                                                       (references/re-review.md)
 ```
 
 ## Step 1 — Locate the PR
@@ -61,6 +66,31 @@ Skip the review and exit silently if any of the following:
 
 If skipping, print the reason ("PR is draft" / "Already reviewed at SHA abc1234") and exit. Do not post anything.
 
+> **Note:** the marker-vs-HEAD check above is a fast bash skip for round-1. Step 2.5 below replaces it with a richer preflight that handles re-review mode (and includes a reply-only re-fire detection that the bash check can't do). If Step 2.5 runs, the skip logic in step 2.2 is subsumed by the preflight manifest — keep step 2.1 (state / draft) as a hard early exit, and rely on the preflight for everything else.
+
+## Step 2.5 — Mode dispatch via preflight script
+
+Run the preflight script. It does all read-side work (existing reviews, GraphQL reviewThreads, marker parsing, force-push check) and emits a manifest JSON.
+
+```bash
+SELF_LOGIN=$(gh api user -q .login)
+MANIFEST_PATH=$(~/.claude/skills/custom-review/scripts/re-review-preflight.sh \
+  "$OWNER" "$REPO" "$PR_NUM" "$HEAD_SHA" "$SELF_LOGIN")
+MODE=$(jq -r .mode "$MANIFEST_PATH")
+```
+
+The manifest lives at `/tmp/custom-review-preflight-<PR_NUM>.json`. Schema is documented in `references/re-review.md` § 1.
+
+**Branch on `MODE`:**
+
+| Mode | Action |
+|---|---|
+| `skip` | Print `skipReason` from the manifest. Exit silently. |
+| `round-1` | Continue to Step 3 with the existing pipeline (Steps 3–7). |
+| `re-review` | Load `references/re-review.md` and follow it. That file governs Steps 5–7 for re-review mode; Steps 3 (conventions gather) and 4 (PR summary) still run as below, with diff scope set to `deltaScope` from the manifest. |
+
+**Hard failure:** if the preflight script exits non-zero, do NOT fall through to round-1 silently — surface the stderr and exit. The preflight is the single source of truth for re-review-vs-round-1 dispatch; bypassing it would mean re-reviewing a PR as if it were round-1 (re-flagging already-resolved findings, never resolving threads, never emitting replies).
+
 ## Step 3 — Gather conventions (bash, no model)
 
 Find all `CLAUDE.md` and `AGENTS.md` files relevant to the PR:
@@ -95,6 +125,10 @@ Save the summary; it is passed as context to all 4 review agents AND to the tria
 Spawn **all four in a single message** (parallel tool calls). Each gets: the PR URL, PR number, HEAD_SHA, the PR summary from step 4, and the convention file paths from step 3.
 
 **Launch order within the message: Opus agents first (#1 bug, #2 blast), then Sonnet agents (#3 conventions, #4 history).** Even with parallel tool calls, list the slow agents first so they queue ahead — Opus latency dominates wall-clock time; you don't want a Sonnet ahead of an Opus in the dispatch list.
+
+**Re-review mode adds a 5th agent — close-loop (Opus, general-purpose).** It walks prior threads in the preflight manifest and decides resolve / push-back per the Q7 heuristic table. Spawn all 5 in a single message; dispatch order is `#1 bug → #2 blast → close-loop → #3 conventions → #4 history` (Opus before Sonnet). Delta-scan agents (#1–#4) in re-review mode use `deltaScope` from the manifest instead of `gh pr diff $PR_NUM` — see `references/re-review.md` § 3–4 for the close-loop prompt and the delta-scope adaptations.
+
+**Scope judgment:** before spawning, follow `references/re-review.md` § 2.5 — skip the 4 delta-scan agents when the delta is small, low-risk, and confined to prior-thread paths. Default-bias is to run them. Public rationale in the body footer.
 
 Each agent returns a JSON-ish list of findings (one finding per item) in the shape:
 
@@ -264,15 +298,26 @@ After all 4 agents return, spawn one general-purpose Sonnet subagent for triage.
 >    `side: "RIGHT"` for added lines, `side: "LEFT"` for removed/deleted lines.
 >    For `Pre-existing` and `Outside change`, `line` is for reader context only — these are posted in the body, not inline.
 
+**Re-review mode addendum:** in re-review mode, triage receives one extra input — the close-loop agent's JSON output. After the dedup pass across the 4 delta-scan agents, also dedup against close-loop push-backs (drop delta-scan findings that overlap a push-back at the same `file:line` + same root cause; the thread reply is the canonical surface). Close-loop output is NOT bucketed or graded by triage — those decisions are inherited from the original thread. See `references/re-review.md` § 5 for the exact prompt addition.
+
 ## Step 7 — Skip-zero, re-check eligibility, hand off to posting reference
 
-**If triage returns 0 findings total → exit silently. Don't post anything.**
+**Round-1 mode:** if triage returns 0 findings total → exit silently. Don't post anything.
+
+**Re-review mode:** zero-check differs. Skip only if **all** of the following hold:
+- triage returned 0 findings, AND
+- close-loop returned 0 entries (no resolves, no push-backs), AND
+- there are 0 ghosted threads from prior rounds
+
+If any of those produced output (or there are ghosted threads to count), still post the re-review body + marker so the next round's preflight sees this round and the round counter advances.
 
 Otherwise:
 
-1. **Re-check eligibility.** Cheap bash repeat of step 2 — guards against the PR being closed/merged while the agents were running. If now ineligible, skip silently.
+1. **Re-check eligibility.** Cheap bash repeat of step 2.1 (state / draft only — the marker check is no longer relevant; we already know the PR has work to do). Guards against the PR being closed/merged while the agents were running. If now ineligible, skip silently.
 
-2. **Load `references/posting.md` and follow it.** That file is the authoritative spec for: pre-flight line validation against diff hunks, payload build, the `gh api` POST, the review-body markdown template, the inline-comment body template, and the known posting pitfalls (renamed-file partial diffs, `patch` truncation, PENDING-review traps). Do not improvise the posting logic — these rules were learned the hard way and the failure modes are silent.
+2. **Post.**
+   - **Round-1 mode:** load `references/posting.md` and follow it. That file is the authoritative spec for: pre-flight line validation against diff hunks, payload build, the `gh api` POST, the review-body markdown template, the inline-comment body template, and the known posting pitfalls (renamed-file partial diffs, `patch` truncation, PENDING-review traps). Do not improvise the posting logic — these rules were learned the hard way and the failure modes are silent.
+   - **Re-review mode:** load `references/re-review.md` § 6–7 and follow it. The post step has a strict order: (1) POST replies via REST, (2) `resolveReviewThread` mutations, (3) POST new review (body + inline). The new review still uses `references/posting.md` for line validation, payload build, and inline-comment template — only the **body template** and the **pre-posting reply + resolve steps** differ between round-1 and re-review.
 
 ## Tool preference order (for #1 and #2)
 
@@ -290,12 +335,16 @@ Check tool availability by attempting to call the preferred tool; fall back on e
 |---|---|
 | PR closed | Skip silently |
 | PR draft | Skip silently |
-| Marker `<!-- custom-review:HEAD_SHA -->` matches current HEAD | Skip silently |
-| Marker present with **different** SHA | Proceed (PR has new commits) |
+| Marker matches HEAD AND no new author replies on prior threads | Skip silently (`mode: skip`, `skipReason: already-reviewed-at-head`) |
+| Marker matches HEAD AND new author replies exist | **Re-review mode fires** — delta-scan returns 0, close-loop processes replies |
+| Marker present with **different** SHA | **Re-review mode fires** (close-loop + delta-scoped scan) |
+| No prior marker | Round-1 mode |
 | No PR found for current branch and no arg | Error message, exit |
-| Zero findings after triage | Skip silently (no "no issues found" placeholder) |
-| Only nit and/or question findings after triage | **Still post** — surfacing nits and questions is intentional |
+| Round-1: zero findings after triage | Skip silently (no "no issues found" placeholder) |
+| Re-review: zero findings AND zero close-loop entries AND zero ghosted threads | Skip silently |
+| Round-1: only nit and/or question findings after triage | **Still post** — surfacing nits and questions is intentional |
 | Re-check at step 7 fails | Skip silently (race with PR close) |
+| Preflight script fails | Hard error, exit non-zero (do not fall through to round-1) |
 
 ## What this skill explicitly does NOT do
 
@@ -326,4 +375,5 @@ This skill replaces the upstream `code-review` plugin with:
 - **Hybrid post format** — inline for in-diff findings, body collapsible for out-of-diff context. Severity emojis prefix every item.
 - **Invariant checking** embedded in agents #2 and #4, not a separate agent.
 - **LSP-first** for TypeScript impact analysis (agent #2) and signature confirmation (agent #1).
-- **One-shot** — no loop, no auto-fix; pair with `/pr-review-and-fix` if you want bot-review-driven auto-fix afterward.
+- **One-shot per invocation** — no internal loop, no auto-fix; but supports a **multi-round flow** via re-review mode (round 2+ adds a 5th Opus agent that walks prior threads, resolves the fixed/accepted ones, and pushes back on the rest). Each round is still a one-shot from the skill's POV — the user triggers each round. Pair with `/pr-review-and-fix` if you want bot-review-driven auto-fix on the PR-author side.
+- **Re-review awareness** — auto-detects re-review via `<!-- custom-review:<SHA> -->` marker, no flag needed. Read-side work lives in `scripts/re-review-preflight.sh` (emits manifest JSON); write-side spec lives in `references/re-review.md`.

@@ -23,7 +23,7 @@ User-invoked. Typical entry: Claude has just planned/implemented something non-t
 
 1. **Detect base branch** for the diff scope. Default: `git symbolic-ref --short refs/remotes/origin/HEAD | sed 's@^origin/@@'`, fall back to `main`. If the current branch equals the base branch, use `--scope working-tree` instead of branch diff.
 2. **Detect project quality gate**: read `package.json` scripts, `Makefile`, `justfile`, or repo `CLAUDE.md` to identify the command that runs type-check/lint/tests. If none found, run whatever the repo conventionally uses; if still unclear, ask the user once.
-3. **Verify Codex is set up** — if the companion script reports missing/unauthenticated, tell the user to run `/codex:setup` and stop.
+3. **Verify Codex is set up** — run `npx -y @openai/codex --version` once to warm the npm cache. If the command fails, or `~/.codex/auth.json` does not exist, tell the user to run `npx -y @openai/codex login` and stop. Auth state in `~/.codex/auth.json` persists regardless of how Codex was previously installed (brew, global npm, npx).
 4. **Pick round budget from the user's argument.** Default: **2**. Tighten or loosen based on cadence words in the prompt:
    - "simple", "quick", "read through", "sanity check", "one pass" → **1**
    - "look", "review", no qualifier → **2** (default)
@@ -52,8 +52,7 @@ Pick one based on what the round is for, not habit:
 
 ### 3. Execution mode
 
-- **Background** for round 1 large diffs. Use idle time to: re-read the plan/spec, run the quality gate, stress-test own reasoning, draft the self-check below.
-- **Foreground** for small diffs and late rounds where you need the result immediately.
+Foreground only. Block on each Codex invocation, capture its final message to a file, and move to triage. No background jobs — there is no companion runtime to track them. For large round-1 diffs you'll wait through the Codex run; use that idle time to re-read the plan/spec, run the quality gate, and draft Step A's self-check before the result lands.
 
 ## Round structure
 
@@ -68,27 +67,54 @@ This seeds adversarial focus text and prevents "just run review and wait." **If 
 
 ### Step B — invoke Codex
 
-Shell out directly to the companion script (the slash commands have `disable-model-invocation: true`):
+Shell out directly to `npx -y @openai/codex exec`. Always capture the final agent message to a file via `--output-last-message` so triage (Step C) reads a clean artifact, not a mix of progress chatter and the result.
+
+Substitute `<sanitized-branch>` (replace `/` with `-`) and `<R>` (round number) into the output paths below.
 
 ```bash
-# generic review (no model/effort flags supported here; runtime default)
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review --wait --base <base> --scope branch
+# generic review — built-in reviewer, no focus text (runtime config defaults)
+npx -y @openai/codex exec review \
+  --base <base> \
+  --output-last-message /tmp/codex-loop-<sanitized-branch>-round-<R>.md
 
-# adversarial review with focus text
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review --wait --base <base> --scope branch "<focus text>"
+# adversarial review — same reviewer, custom focus text appended
+npx -y @openai/codex exec review \
+  --base <base> \
+  --output-last-message /tmp/codex-loop-<sanitized-branch>-round-<R>.md \
+  "<focus text>"
 
-# background variants — use Bash(run_in_background: true) and poll /codex:status via:
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status --all
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" result <job-id>
+# working-tree scope (on the base branch, or no divergence) — swap --base for --uncommitted
+npx -y @openai/codex exec review \
+  --uncommitted \
+  --output-last-message /tmp/codex-loop-<sanitized-branch>-round-<R>.md \
+  "<focus text or omit>"
 ```
 
-For **rescue** (second-draft implementation / reproducer test / stuck-point diagnosis), use the `codex:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex:codex-rescue"`). Forward a tight GPT-5.5-style prompt. Always pin model and effort:
+For **rescue** (second-draft implementation / reproducer test / stuck-point diagnosis), invoke `codex exec` directly with pinned model and reasoning effort. Pick the sandbox by intent:
 
-```
---model gpt-5.5 --effort xhigh [--write] [--resume] <prompt text>
+```bash
+# read-only rescue — diagnosis or second-draft idea without applying edits
+npx -y @openai/codex exec \
+  -m gpt-5.5 -c model_reasoning_effort=xhigh \
+  -s read-only \
+  --output-last-message /tmp/codex-loop-<sanitized-branch>-rescue-<R>.md \
+  "<prompt text>"
+
+# write-capable rescue — let Codex apply edits in the workspace
+npx -y @openai/codex exec \
+  -m gpt-5.5 -c model_reasoning_effort=xhigh \
+  -s workspace-write \
+  --output-last-message /tmp/codex-loop-<sanitized-branch>-rescue-<R>.md \
+  "<prompt text>"
 ```
 
-**Do NOT** pass `--model`/`--effort` to `review`/`adversarial-review` — those flags are rejected there. They apply only to `task` (rescue).
+After the command returns, Read the `--output-last-message` file and feed its contents into Step C as the raw Codex output.
+
+Notes:
+
+- `npx -y @openai/codex` is slower than a directly-installed binary on first invocation (downloads/extracts the package); subsequent runs use the npm cache. Do not speculatively run `--help` or exploratory args — every invocation is a real run.
+- `codex exec review` does NOT accept `-m`/`--model`; let the configured default stand. `codex exec` (rescue) does accept `-m` and `-c model_reasoning_effort=…` overrides.
+- If `gpt-5.5` is rejected (model rename, account access), drop `-m` and fall back to the user's `~/.codex/config.toml` default.
 
 ### Step C — triage findings (fresh-context subagent)
 
@@ -254,18 +280,26 @@ For non-runtime findings (CSP, lint, convention, config, naming, type-safety, sc
 
 Steps:
 
-1. **Pushback** — `codex:codex-rescue` with `--resume`:
+1. **Pushback** — resume the last Codex session and challenge the finding:
 
-   ```
-   I'm Claude. I marked your finding "<brief>" as invalid because <reasoning with file:line evidence>. Reconsider: is your finding still load-bearing? If yes, state why my evidence is wrong. If no, retract.
+   ```bash
+   npx -y @openai/codex exec resume --last \
+     -m gpt-5.5 -c model_reasoning_effort=xhigh \
+     -s read-only \
+     --output-last-message /tmp/codex-loop-<sanitized-branch>-escalation-<R>.md \
+     "I'm Claude. I marked your finding \"<brief>\" as invalid because <reasoning with file:line evidence>. Reconsider: is your finding still load-bearing? If yes, state why my evidence is wrong. If no, retract."
    ```
 
 2. **If Codex retracts** → invalid, move on.
 
-3. **If Codex insists** → reproducer-evidence round (final tiebreaker):
+3. **If Codex insists** → reproducer-evidence round (final tiebreaker). Resume the same session and ask for code:
 
-   ```
-   We disagree. Settle it with code. Produce a minimal failing test or reproducer that demonstrates the bug. If you cannot produce one, retract.
+   ```bash
+   npx -y @openai/codex exec resume --last \
+     -m gpt-5.5 -c model_reasoning_effort=xhigh \
+     -s workspace-write \
+     --output-last-message /tmp/codex-loop-<sanitized-branch>-reproducer-<R>.md \
+     "We disagree. Settle it with code. Produce a minimal failing test or reproducer that demonstrates the bug. If you cannot produce one, retract."
    ```
 
 4. **Run the reproducer:**
@@ -308,9 +342,9 @@ Keep it scannable — headers + short bullets, not prose.
 
 ## Operating notes
 
-- **Model/effort discipline**: always `--model gpt-5.5 --effort xhigh` on rescue calls. Review/adversarial-review do not accept these flags — let the runtime default stand.
-- **Prompt style for rescue**: follow the `codex:gpt-5-4-prompting` skill (compact, XML-tagged, explicit output contract). The rescue subagent applies that skill automatically when shaping prompts.
-- **Do not speculatively invoke the companion script** for `--help` or exploration — it treats unknown args as a real prompt/focus and will start a real Codex run.
-- **Background jobs**: when launching review in the background, track the job ID from stdout and poll via `status`. Don't block the turn on it; switch to reading the spec, running the quality gate, or writing the pre-round self-check while it runs.
+- **Model/effort discipline**: always `-m gpt-5.5 -c model_reasoning_effort=xhigh` on rescue calls. Review (`codex exec review`) does not accept `-m` — let the configured default stand.
+- **Foreground only**: every Codex invocation blocks this turn. There is no background job runtime in this skill; do not try to launch one or poll for status.
+- **Prompt style for rescue**: follow the `codex:gpt-5-4-prompting` skill (compact, XML-tagged, explicit output contract) when shaping rescue prompts. Apply it inline — this skill no longer routes through the `codex:codex-rescue` subagent.
+- **Do not speculatively invoke `npx -y @openai/codex`** for `--help` or exploration — `codex exec` treats unknown args as a real prompt and starts a real run. The one allowed warm-up call is the `--version` check in "Before round 1" step 3.
 - **Auditor framing in prompts**: when invoking Step E's pushback / reproducer escalation, address Codex as a peer for that specific exchange ("we disagree", "settle it with code"). Outside Step E, Codex's findings are audit input — useful but not authoritative — and the triage subagent classifies them.
 - **Never silently pick a winner on standoffs.** Surface to the user. That is a load-bearing property of this skill.

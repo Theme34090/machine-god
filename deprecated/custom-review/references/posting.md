@@ -10,6 +10,8 @@ Loaded by SKILL.md step 7 once triage has produced a non-empty findings list. Co
 4. Review body markdown template
 5. Inline comment body template
 6. Known posting pitfalls
+7. Replying to a prior thread (re-review mode)
+8. Resolving a thread via GraphQL (re-review mode)
 
 ---
 
@@ -171,3 +173,40 @@ Each finding in `comments[]` has a `body` field. Format:
 - **`patch` field truncation.** The `patch` returned by `/pulls/N/files` is capped at ~3000 lines per file. For files where `patch` is missing or truncated, fall back to `git diff origin/$BASE...$HEAD_SHA -- $PATH` locally and parse hunk headers yourself.
 - **Trailing-newline mismatch.** `wc -l` counts newlines; a file without a trailing newline has `wc -l` = `actual_lines - 1`. Use `awk 'END {print NR}'` for the authoritative line count.
 - **PENDING reviews are not invisible to you.** Omitting `event` from the POST body creates a draft review. It's hidden from non-authors via REST but the GitHub UI sidebar shows it to the actor as a "Pending" badge. Always pass `"event": "COMMENT"`.
+
+---
+
+## 7. Replying to a prior thread (re-review mode)
+
+Used by the re-review pipeline (see `references/re-review.md`). Replies attach to the **first comment** of a thread, not to the thread node ID:
+
+```bash
+gh api --method POST \
+  "repos/$OWNER/$REPO/pulls/$PR_NUM/comments/$FIRST_COMMENT_DATABASE_ID/replies" \
+  -f body="$REPLY_TEXT"
+```
+
+`$FIRST_COMMENT_DATABASE_ID` is the REST numeric id (the `databaseId` field from GraphQL, same as the `id` shown in `#discussion_r<id>` URLs). The preflight manifest exposes this as `firstCommentDatabaseId` on each prior thread.
+
+The reply lands in the same thread as the original review comment, visible inline at the same `(path, line)`. It does NOT create a new review.
+
+---
+
+## 8. Resolving a thread via GraphQL (re-review mode)
+
+REST does not expose thread-resolution state and does not provide a resolve mutation. Use the GraphQL `resolveReviewThread` mutation:
+
+```bash
+gh api graphql -f query='
+mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread { id isResolved }
+  }
+}' -f threadId="$THREAD_ID"
+```
+
+`$THREAD_ID` is the GraphQL **node ID** (e.g. `PRRT_kw...`), NOT the databaseId. The preflight manifest exposes this as `threadId` on each prior thread.
+
+**Order replies before resolves.** If you POST a reply and then resolve, the reply is visible in the resolved-thread view. If you resolve first, GitHub still accepts the reply but it lands in a collapsed thread and is easy for the author to miss.
+
+**Race with manual resolution.** If `resolveReviewThread` errors with "Thread is already resolved" (or similar), treat as success — the author may have resolved manually between preflight read and post.
