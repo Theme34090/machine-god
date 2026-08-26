@@ -1,3 +1,8 @@
+---
+name: review-assist
+description: Triage code-review findings from other agents into severity buckets (must-fix / should-fix / nice-to-have) so the user can decide the next step. Use when handling the output of a code review, a codex review, a thermos review, or any list of review findings that needs prioritizing.
+---
+
 # Review Assist
 
 Triage issues from code review from other agents and put them into buckets to help user take next step.
