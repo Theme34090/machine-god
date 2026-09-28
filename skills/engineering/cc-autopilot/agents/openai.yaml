@@ -1,0 +1,3 @@
+interface:
+  display_name: "Autopilot"
+  short_description: "Execute an approved plan autonomously: state done as a checkable predicate, drive to it without stop"

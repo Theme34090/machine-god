@@ -1,0 +1,3 @@
+interface:
+  display_name: "No Comments"
+  short_description: "Strip comments from a diff before review: spawn Comment Sicko, fix accepted findings, and offer enco"

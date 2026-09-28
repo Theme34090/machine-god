@@ -1,0 +1,3 @@
+interface:
+  display_name: "Code Review"
+  short_description: "Two-pass correctness review of a branch: external reviewer finds, adversarial judge refutes; the calling agent reports"

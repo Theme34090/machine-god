@@ -1,0 +1,3 @@
+interface:
+  display_name: "Frens"
+  short_description: "Spawn a subagent by role (explore, code, judge, panel, sicko) on the model and harness configured fo"
