@@ -37,6 +37,25 @@ spec_section() {
 	printf '</spec>\n'
 }
 root="$(git rev-parse --show-toplevel)"
+model=gpt-6.1-sol
+judge_model=zai/glm-5.3:high
+
+count() { if [ -f "$1" ]; then grep -ciE "$2" "$1" || true; else echo 0; fi; }
+
+# One line per run in the shared index, whatever the exit path.
+log_run() {
+	status=$?
+	jq -nc --arg ts "$(date -u +%FT%TZ)" --arg skill code-review --arg repo "$repo" \
+		--arg branch "$(git rev-parse --abbrev-ref HEAD)" --arg base "$base" --arg from "$from" --arg head "$head" \
+		--arg model "$model medium" --arg judge "$judge_model" --arg spec "$spec" --arg run "$run" \
+		--argjson exit "$status" --argjson secs "$((SECONDS - started))" \
+		--argjson findings "$(count "$run/review.md" '^\[(critical|high|medium)\]')" \
+		--argjson confirmed "$(count "$run/verdict.md" '^\[CONFIRMED\]')" \
+		--argjson refuted "$(count "$run/verdict.md" '^\[REFUTED\]')" \
+		--argjson unverifiable "$(count "$run/verdict.md" '^\[UNVERIFIABLE\]')" \
+		--argjson covered "$(count "$run/verdict.md" '^\[COVERED\]')" \
+		'$ARGS.named' >> "$HOME/.agents/reviews/index.jsonl"
+}
 
 judge() {
 	run="$1"
@@ -52,20 +71,20 @@ judge() {
 	} > "$run/judge-prompt.md"
 
 	printf 'judging...\n' >&2
-	if ! pi -p --no-session --mode text --tools read,bash --model zai/glm-5.3:high \
+	if ! pi -p --no-session --mode text --tools read,bash --model "$judge_model" \
 		"$(cat "$run/judge-prompt.md")" > "$run/verdict.md" 2> "$run/judge-err.log"; then
 		printf 'pi failed; see %s\n' "$run/judge-err.log" >&2
 		tail -n 20 "$run/judge-err.log" >&2
-		exit 1
+		return 1
 	fi
 	if [ ! -s "$run/verdict.md" ]; then
 		printf 'pi returned no output; see %s\n' "$run/judge-err.log" >&2
-		exit 1
+		return 1
 	fi
 }
 
 if [ -n "$judge_only" ]; then
-	judge "$judge_only"
+	judge "$judge_only" || exit 3
 	cat "$judge_only/verdict.md"
 	exit 0
 fi
@@ -99,8 +118,12 @@ if [ -z "$(printf %s "$diff" | tr -d '[:space:]')" ]; then
 	exit 0
 fi
 
-run="$root/.context/code-review/$(date +%Y%m%d-%H%M%S)"
+repo="$(basename -s .git "$(git remote get-url origin 2>/dev/null || printf %s "$root")")"
+run="$HOME/.agents/reviews/$repo/$(date +%Y%m%d-%H%M%S)-$$-code-review"
 mkdir -p "$run"
+started=$SECONDS
+trap log_run EXIT
+printf 'Run:    %s\n' "$run"
 printf '%s\n' "$diff" > "$run/diff.patch"
 [ -z "$spec" ] || cp "$spec" "$run/spec.md"
 
@@ -121,7 +144,7 @@ done < <(codex mcp list --json | jq -r '.[].name')
 
 printf 'reviewing...\n' >&2
 if ! codex exec --ephemeral --skip-git-repo-check -C "$dir" "${isolate[@]}" \
-	-m gpt-5.6-sol -c model_reasoning_effort=medium \
+	-m "$model" -c model_reasoning_effort=medium \
 	-o "$run/review.md" - < "$run/prompt.md" > "$run/codex.log" 2> "$run/err.log"; then
 	printf 'codex failed (%s); see %s\n' "$run/err.log" "$run/codex.log" >&2
 	tail -n 20 "$run/err.log" >&2
@@ -137,10 +160,13 @@ if [ "$(tr -d '[:space:]' < "$run/review.md")" = "Nofindings." ]; then
 	exit 0
 fi
 
-judge "$run"
-
 printf '## Review (%s)\n\n' "$run/review.md"
 cat "$run/review.md"
+
+if ! judge "$run"; then
+	printf '\nJudge failed; findings unjudged.\n'
+	exit 3
+fi
 printf '\n## Verdict (%s)\n\n' "$run/verdict.md"
 cat "$run/verdict.md"
 [ -z "$(tail -c1 "$run/verdict.md")" ] || printf '\n'

@@ -1,3 +1,0 @@
-interface:
-  display_name: "Quality Review"
-  short_description: "One-pass code-standards review of the current diff by a fast external reviewer; the calling agent judges"
