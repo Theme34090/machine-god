@@ -13,6 +13,7 @@
    - The scope of this time
    - What counts as completion
 - **ALWAYS** reply to user in English
+- If running something can answer the question and it's within your bound and safe to run, try run it instead of asking.
 
 ## NEVER
 
