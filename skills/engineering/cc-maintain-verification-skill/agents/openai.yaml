@@ -1,3 +1,0 @@
-interface:
-  display_name: "Maintain Verification Skill"
-  short_description: "Periodic pass that keeps a project's verification skill and feature map honest: source readers per feature, one live pass, at most one PR."

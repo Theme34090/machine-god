@@ -23,6 +23,8 @@ done
 
 model="${QR_MODEL:-gpt-6.1-sol}"
 effort="${QR_EFFORT:-medium}"
+docs_model="${QR_DOCS_MODEL:-claude-haiku-5-5}"
+docs_effort="${QR_DOCS_EFFORT:-high}"
 skill_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ -n "$spec" ]; then
@@ -38,11 +40,13 @@ log_run() {
 	status=$?
 	findings=0
 	[ ! -f "$run/out.md" ] || findings="$(grep -cE '^[^[:space:]]+:[0-9]+ — ' "$run/out.md" || true)"
+	docs=null
+	[ ! -f "$run/docs-out.md" ] || docs="$(grep -cE '^[^[:space:]]+:[0-9]+ — ' "$run/docs-out.md" || true)"
 	jq -nc --arg ts "$(date -u +%FT%TZ)" --arg skill quality-review --arg repo "$repo" \
 		--arg branch "$(git rev-parse --abbrev-ref HEAD)" --arg base "$base" \
 		--arg from "$(git rev-parse "$from")" --arg head "$(git rev-parse HEAD)" \
 		--arg model "$model $effort" --arg spec "$spec" --arg run "$run" \
-		--argjson exit "$status" --argjson secs "$((SECONDS - started))" --argjson findings "$findings" \
+		--argjson exit "$status" --argjson secs "$((SECONDS - started))" --argjson findings "$findings" --argjson docs "$docs" \
 		'$ARGS.named' >> "$HOME/.agents/reviews/index.jsonl"
 }
 
@@ -85,24 +89,87 @@ printf 'Run: %s\n' "$run"
 	fi
 } > "$run/prompt.md"
 
-if ! codex exec --ephemeral --skip-git-repo-check -C "$dir" \
+is_doc() {
+	case "$1" in *.md|*.mdx|*.rst|docs/*|*/docs/*) return 0 ;; esac
+	return 1
+}
+
+# The docs pass runs when the diff touches a doc, or deletes or renames a path a doc still mentions.
+doc_changed=()
+doc_new=()
+while IFS= read -r f; do
+	if is_doc "$f"; then doc_changed+=("$f"); fi
+done < <(git diff --name-only "$from" -- ${paths[@]+"${paths[@]}"})
+while IFS= read -r f; do
+	if is_doc "$f"; then doc_new+=("$f"); fi
+done < <(git ls-files --others --exclude-standard --full-name -- ${paths[@]+"${paths[@]}"})
+
+orphans=""
+while IFS=$'\t' read -r status old _; do
+	case "$status" in D|R*) ;; *) continue ;; esac
+	hits="$(git -C "$root" grep -lF -e "$old" -- '*.md' '*.mdx' '*.rst' 'docs/' | tr '\n' ' ' || true)"
+	[ -z "$hits" ] || orphans+="- \`$old\` ($status) is still mentioned in: $hits"$'\n'
+done < <(git diff --name-status -M "$from" -- ${paths[@]+"${paths[@]}"})
+
+docs_pid=""
+if [ ${#doc_changed[@]} -gt 0 ] || [ ${#doc_new[@]} -gt 0 ] || [ -n "$orphans" ]; then
+	{
+		cat "$skill_dir/references/docs-reviewer-prompt.md"
+		printf '\n## Docs Standard\n\n'
+		cat "$skill_dir/references/docs-standard.md"
+		printf '\n## Doc diff\n\nPaths relative to %s, against %s.\n\n<diff>\n' "$root" "$from"
+		[ ${#doc_changed[@]} -eq 0 ] || git -C "$root" diff "$from" -- "${doc_changed[@]}"
+		for f in ${doc_new[@]+"${doc_new[@]}"}; do
+			(cd "$root" && git diff --no-index -- /dev/null "$f" || true)
+		done
+		printf '</diff>\n'
+		[ -z "$orphans" ] || printf '\n## Orphaned\n\nPaths this diff deleted (D) or renamed (R) that tracked docs still mention:\n\n%s' "$orphans"
+	} > "$run/docs-prompt.md"
+	(cd "$root" && claude -p --model "$docs_model" --effort "$docs_effort" \
+		--tools Read,Grep,Glob --allowedTools Read,Grep,Glob \
+		--strict-mcp-config --no-session-persistence --output-format text \
+		< "$run/docs-prompt.md" > "$run/docs-out.md" 2> "$run/docs-err.log") &
+	docs_pid=$!
+fi
+
+codex exec --ephemeral --skip-git-repo-check -C "$dir" \
 	-m "$model" -c model_reasoning_effort="$effort" \
-	-o "$run/out.md" - < "$run/prompt.md" > "$run/codex.log" 2> "$run/err.log"; then
-	printf 'codex failed (%s); see %s\n' "$run/err.log" "$run/codex.log" >&2
-	tail -n 20 "$run/err.log" >&2
-	exit 1
-fi
+	-o "$run/out.md" - < "$run/prompt.md" > "$run/codex.log" 2> "$run/err.log" &
+code_pid=$!
 
-if [ ! -s "$run/out.md" ]; then
-	printf 'codex returned no output; see %s\n' "$run/codex.log" >&2
-	exit 1
-fi
+code_ok=1
+wait "$code_pid" || code_ok=0
+docs_ok=1
+[ -z "$docs_pid" ] || wait "$docs_pid" || docs_ok=0
 
-if ! grep -qE '^No findings\.|^[^[:space:]]+:[0-9]+ — ' "$run/out.md"; then
-	printf 'reviewer output has no findings block; see %s\n' "$run/out.md" >&2
-	cat "$run/out.md" >&2
-	exit 1
-fi
+# check <pass> <out> <log> <ok>
+check() {
+	if [ "$4" -eq 0 ]; then
+		printf '%s pass failed; see %s\n' "$1" "$3" >&2
+		tail -n 20 "$3" >&2
+		return 1
+	fi
+	if [ ! -s "$2" ]; then
+		printf '%s pass returned no output; see %s\n' "$1" "$3" >&2
+		return 1
+	fi
+	if ! grep -qE '^No findings\.|^[^[:space:]]+:[0-9]+ — ' "$2"; then
+		printf '%s pass output has no findings block; see %s\n' "$1" "$2" >&2
+		cat "$2" >&2
+		return 1
+	fi
+}
 
+check code "$run/out.md" "$run/err.log" "$code_ok"
+[ -z "$docs_pid" ] || check docs "$run/docs-out.md" "$run/docs-err.log" "$docs_ok"
+
+printf '## Code\n\n'
 cat "$run/out.md"
 [ -z "$(tail -c1 "$run/out.md")" ] || printf '\n'
+printf '\n## Docs\n\n'
+if [ -z "$docs_pid" ]; then
+	printf 'Skipped: no doc touched or orphaned.\n'
+else
+	cat "$run/docs-out.md"
+	[ -z "$(tail -c1 "$run/docs-out.md")" ] || printf '\n'
+fi
